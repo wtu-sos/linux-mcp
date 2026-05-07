@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Config with sensitive info
+config.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

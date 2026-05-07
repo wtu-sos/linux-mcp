@@ -1,0 +1,13 @@
+{
+    "host": "192.168.1.100",
+    "port": 22,
+    "username": "root",
+    "key_file": "~/.ssh/id_rsa",
+    "timeout": 30,
+    "command_timeout": 60,
+    "max_output_size": 1048576,
+    "trash_dir": "~/.linux_mcp_trash",
+    "audit_log_path": "~/.linux_mcp_audit.log",
+    "max_trash_size": 104857600,
+    "max_audit_size": 10485760
+}
