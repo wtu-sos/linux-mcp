@@ -2,16 +2,15 @@
 
 import json
 import os
-from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field, model_validator
 
 
-class Config(BaseModel):
-    """Configuration for SSH connection and safety layer."""
+class ServerConfig(BaseModel):
+    """单个服务器的 SSH 连接和安全层配置。"""
 
-    # SSH connection
+    name: str = Field(description="服务器名称，用于工具调用时指定目标")
     host: str = Field(default="", description="远程主机地址")
     port: int = Field(default=22, description="SSH 端口")
     username: str = Field(default="", description="SSH 用户名")
@@ -51,14 +50,16 @@ class Config(BaseModel):
     )
 
     @model_validator(mode="after")
-    def validate_required_fields(self) -> "Config":
+    def validate_required_fields(self) -> "ServerConfig":
         """Validate that required fields are present."""
         if not self.host:
-            raise ValueError("host 是必填项，请通过配置文件或 SSH_HOST 环境变量设置")
+            raise ValueError(f"服务器 '{self.name}': host 是必填项")
         if not self.username:
-            raise ValueError("username 是必填项，请通过配置文件或 SSH_USER 环境变量设置")
+            raise ValueError(f"服务器 '{self.name}': username 是必填项")
         if not self.password and not self.key_file:
-            raise ValueError("必须提供 password 或 key_file 中的至少一种认证方式")
+            raise ValueError(
+                f"服务器 '{self.name}': 必须提供 password 或 key_file 中的至少一种认证方式"
+            )
         return self
 
     def expand_remote_path(self, path: str) -> str:
@@ -89,71 +90,80 @@ class Config(BaseModel):
         return None
 
 
-def load_config_from_file(config_path: str) -> dict:
-    """从 JSON 文件加载配置。"""
+class AppConfig(BaseModel):
+    """应用顶层配置，包含多台服务器配置。"""
+
+    servers: list[ServerConfig]
+
+    @model_validator(mode="after")
+    def validate_names_unique(self) -> "AppConfig":
+        """验证服务器名称唯一性。"""
+        names = [s.name for s in self.servers]
+        if len(names) != len(set(names)):
+            seen = set()
+            for n in names:
+                if n in seen:
+                    raise ValueError(f"服务器名称重复: '{n}'")
+                seen.add(n)
+        if not self.servers:
+            raise ValueError("至少需要配置一台服务器")
+        return self
+
+    @property
+    def is_single_server(self) -> bool:
+        return len(self.servers) == 1
+
+    @property
+    def default_name(self) -> str:
+        return self.servers[0].name
+
+    def get_server(self, name: str) -> ServerConfig:
+        for s in self.servers:
+            if s.name == name:
+                return s
+        raise ValueError(f"服务器 '{name}' 不存在")
+
+    @property
+    def server_names(self) -> list[str]:
+        return [s.name for s in self.servers]
+
+
+def _load_json_file(config_path: str) -> dict:
+    """从 JSON 文件加载原始配置。"""
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def load_config_from_env() -> dict:
-    """从环境变量加载配置。"""
-    env_mapping = {
-        "host": "SSH_HOST",
-        "port": "SSH_PORT",
-        "username": "SSH_USER",
-        "password": "SSH_PASSWORD",
-        "key_file": "SSH_KEY_FILE",
-        "timeout": "SSH_TIMEOUT",
-        "command_timeout": "SSH_COMMAND_TIMEOUT",
-        "max_output_size": "MCP_MAX_OUTPUT_SIZE",
-        "max_read_size": "MCP_MAX_READ_SIZE",
-        "max_upload_size": "MCP_MAX_UPLOAD_SIZE",
-        "trash_dir": "MCP_TRASH_DIR",
-        "audit_log_path": "MCP_AUDIT_LOG",
-        "max_trash_size": "MCP_MAX_TRASH_SIZE",
-        "max_audit_size": "MCP_MAX_AUDIT_SIZE",
-        "max_processes": "MCP_MAX_PROCESSES",
-    }
-
-    env_config = {}
-    for key, env_var in env_mapping.items():
-        value = os.environ.get(env_var)
-        if value is not None:
-            # Convert numeric types
-            if key in (
-                "port",
-                "timeout",
-                "command_timeout",
-                "max_output_size",
-                "max_read_size",
-                "max_upload_size",
-                "max_trash_size",
-                "max_audit_size",
-                "max_processes",
-            ):
-                try:
-                    env_config[key] = int(value)
-                except ValueError:
-                    pass
-            else:
-                env_config[key] = value
-
-    return env_config
+def _merge_with_defaults(server: dict, defaults: dict) -> dict:
+    """合并 defaults 和 server 条目，server 覆盖 defaults。"""
+    merged = {**defaults, **server}
+    return merged
 
 
-def create_config(config_path: Optional[str] = None) -> Config:
-    """创建配置对象。
+def _wrap_legacy_format(raw: dict) -> dict:
+    """将旧格式（扁平）包装为新格式。"""
+    if "host" in raw and "servers" not in raw:
+        return {"servers": [{"name": "default", **raw}]}
+    return raw
 
-    优先级：环境变量 > 配置文件 > 默认值
+
+def load_config(config_path: str) -> AppConfig:
+    """从 JSON 配置文件加载配置。
+
+    支持新格式（servers 数组 + defaults）和旧格式（扁平）自动兼容。
     """
-    config_data = {}
+    raw = _load_json_file(config_path)
 
-    # 1. 从配置文件加载
-    if config_path:
-        config_data.update(load_config_from_file(config_path))
+    # 旧格式兼容
+    raw = _wrap_legacy_format(raw)
 
-    # 2. 环境变量覆盖
-    config_data.update(load_config_from_env())
+    # 提取 defaults
+    defaults = raw.pop("defaults", {})
 
-    # 3. 创建并验证
-    return Config(**config_data)
+    # 合并并构建 ServerConfig
+    servers = []
+    for s in raw["servers"]:
+        merged = _merge_with_defaults(s, defaults)
+        servers.append(ServerConfig(**merged))
+
+    return AppConfig(servers=servers)

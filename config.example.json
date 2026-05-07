@@ -1,13 +1,31 @@
 {
-    "host": "192.168.1.100",
-    "port": 22,
-    "username": "root",
-    "key_file": "~/.ssh/id_rsa",
-    "timeout": 30,
-    "command_timeout": 60,
-    "max_output_size": 1048576,
-    "trash_dir": "~/.linux_mcp_trash",
-    "audit_log_path": "~/.linux_mcp_audit.log",
-    "max_trash_size": 104857600,
-    "max_audit_size": 10485760
+    "defaults": {
+        "port": 22,
+        "timeout": 30,
+        "command_timeout": 60,
+        "max_output_size": 1048576,
+        "max_read_size": 10485760,
+        "max_upload_size": 10485760,
+        "trash_dir": "~/.linux_mcp_trash",
+        "audit_log_path": "~/.linux_mcp_audit.log",
+        "max_trash_size": 104857600,
+        "max_audit_size": 10485760,
+        "max_processes": 200
+    },
+    "servers": [
+        {
+            "name": "prod-web1",
+            "host": "192.168.1.100",
+            "username": "root",
+            "key_file": "~/.ssh/id_rsa"
+        },
+        {
+            "name": "staging",
+            "host": "10.0.3.1",
+            "port": 2222,
+            "username": "deploy",
+            "key_file": "~/.ssh/staging_key",
+            "timeout": 60
+        }
+    ]
 }

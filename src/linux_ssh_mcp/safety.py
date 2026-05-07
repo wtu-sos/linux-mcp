@@ -5,7 +5,7 @@ import re
 from typing import Any, Optional
 
 from .audit import AuditLogger
-from .config import Config
+from .config import ServerConfig
 from .ssh_client import SSHClient
 from .trash import TrashManager
 
@@ -126,7 +126,7 @@ class SafetyGate:
 
     def __init__(
         self,
-        config: Config,
+        config: ServerConfig,
         ssh_client: SSHClient,
         audit_logger: AuditLogger,
         trash_manager: TrashManager,

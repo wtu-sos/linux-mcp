@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from .config import Config
+from .config import ServerConfig
 from .ssh_client import SSHClient
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class AuditLogger:
     """审计日志记录器，将操作记录以 JSON Lines 格式写入远程主机。"""
 
-    def __init__(self, config: Config, ssh_client: SSHClient):
+    def __init__(self, config: ServerConfig, ssh_client: SSHClient):
         self._config = config
         self._ssh = ssh_client
         self._log_path = config.audit_log_path_expanded

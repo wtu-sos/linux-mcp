@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 import asyncssh
 
-from .config import Config
+from .config import ServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class SSHClient:
     """Async SSH client for remote Linux operations."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: ServerConfig):
         self._config = config
         self._conn: Optional[asyncssh.SSHClientConnection] = None
         self._lock = asyncio.Lock()

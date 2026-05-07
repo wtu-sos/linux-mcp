@@ -2,8 +2,10 @@
 
 import argparse
 import asyncio
+import copy
 import logging
 import sys
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from mcp.server import Server
@@ -11,7 +13,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from .audit import AuditLogger
-from .config import Config, create_config
+from .config import AppConfig, ServerConfig, load_config
 from .safety import SafetyGate
 from .ssh_client import SSHClient
 from .trash import TrashManager
@@ -19,31 +21,52 @@ from .trash import TrashManager
 logger = logging.getLogger(__name__)
 
 # 全局状态
-_config: Optional[Config] = None
-_ssh: Optional[SSHClient] = None
-_audit: Optional[AuditLogger] = None
-_trash: Optional[TrashManager] = None
-_safety: Optional[SafetyGate] = None
+_app_config: Optional[AppConfig] = None
+_contexts: dict[str, "ServerContext"] = {}
 
 
-def get_ssh() -> SSHClient:
-    assert _ssh is not None, "SSH 客户端未初始化"
-    return _ssh
+@dataclass
+class ServerContext:
+    """单台服务器的完整上下文。"""
+    config: ServerConfig
+    ssh: SSHClient
+    audit: AuditLogger
+    trash: TrashManager
+    safety: SafetyGate
 
 
-def get_audit() -> AuditLogger:
-    assert _audit is not None, "审计日志未初始化"
-    return _audit
+def get_context(name: str) -> ServerContext:
+    """获取指定服务器的上下文。"""
+    ctx = _contexts.get(name)
+    if ctx is None:
+        raise ValueError(f"服务器 '{name}' 未初始化")
+    return ctx
 
 
-def get_trash() -> TrashManager:
-    assert _trash is not None, "回收站管理器未初始化"
-    return _trash
+def resolve_server(server_name: Optional[str]) -> str:
+    """解析并验证 server_name。
 
+    单服务器模式：自动返回默认名称。
+    多服务器模式：必填，不存在则报错。
+    """
+    assert _app_config is not None
 
-def get_safety() -> SafetyGate:
-    assert _safety is not None, "安全网关未初始化"
-    return _safety
+    if _app_config.is_single_server:
+        return _app_config.default_name
+
+    if not server_name:
+        names = ", ".join(_app_config.server_names)
+        raise ValueError(
+            f"必须指定 server_name。可用服务器: {names}"
+        )
+
+    if server_name not in _contexts:
+        names = ", ".join(_app_config.server_names)
+        raise ValueError(
+            f"服务器 '{server_name}' 不存在。可用服务器: {names}"
+        )
+
+    return server_name
 
 
 # ============================================================
@@ -56,16 +79,16 @@ async def handle_run_command(
     cwd: Optional[str] = None,
     timeout: Optional[int] = None,
     rollback_command: Optional[str] = None,
+    server_name: Optional[str] = None,
 ) -> str:
     """执行 Shell 命令。"""
-    ssh = get_ssh()
-    safety = get_safety()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
     # 安全检查
-    check = await safety.pre_check_command(command, rollback_command)
+    check = await ctx.safety.pre_check_command(command, rollback_command)
     if not check["allowed"]:
-        await audit.log(
+        await ctx.audit.log(
             operation="run_command",
             params={"command": command},
             result="rejected",
@@ -74,10 +97,10 @@ async def handle_run_command(
         return f"❌ 命令被拒绝: {check['reason']}"
 
     # 执行命令
-    result = await ssh.execute(command, cwd=cwd, timeout=timeout)
+    result = await ctx.ssh.execute(command, cwd=cwd, timeout=timeout)
 
     # 记录审计日志
-    await audit.log(
+    await ctx.audit.log(
         operation="run_command",
         params={
             "command": command,
@@ -98,14 +121,17 @@ async def handle_run_command(
     return "\n\n".join(output_parts)
 
 
-async def handle_read_file(path: str) -> str:
+async def handle_read_file(
+    path: str,
+    server_name: Optional[str] = None,
+) -> str:
     """读取远程文件。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
-    result = await ssh.read_file(path)
+    result = await ctx.ssh.read_file(path)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="read_file",
         params={"path": path},
         result="success" if result["success"] else "error",
@@ -117,24 +143,27 @@ async def handle_read_file(path: str) -> str:
     return f"❌ {result['error']}"
 
 
-async def handle_write_file(path: str, content: str) -> str:
+async def handle_write_file(
+    path: str,
+    content: str,
+    server_name: Optional[str] = None,
+) -> str:
     """写入远程文件（覆盖前备份旧版本到回收站）。"""
-    ssh = get_ssh()
-    trash = get_trash()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
     # 如果文件已存在，先备份到回收站
     rollback_id = None
-    exists = await ssh.file_exists(path)
+    exists = await ctx.ssh.file_exists(path)
     if exists:
-        backup_result = await trash.move_to_trash(path, "write_file_backup")
+        backup_result = await ctx.trash.move_to_trash(path, "write_file_backup")
         if backup_result["success"]:
             rollback_id = backup_result["entry_id"]
 
     # 写入新内容
-    result = await ssh.write_file(path, content)
+    result = await ctx.ssh.write_file(path, content)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="write_file",
         params={"path": path, "size": len(content)},
         result="success" if result["success"] else "error",
@@ -150,14 +179,17 @@ async def handle_write_file(path: str, content: str) -> str:
     return f"❌ {result['error']}"
 
 
-async def handle_list_directory(path: str) -> str:
+async def handle_list_directory(
+    path: str,
+    server_name: Optional[str] = None,
+) -> str:
     """列出目录内容。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
-    result = await ssh.list_dir(path)
+    result = await ctx.ssh.list_dir(path)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="list_directory",
         params={"path": path},
         result="success" if result["success"] else "error",
@@ -179,16 +211,18 @@ async def handle_list_directory(path: str) -> str:
     return "\n".join(lines)
 
 
-async def handle_delete_file(path: str) -> str:
+async def handle_delete_file(
+    path: str,
+    server_name: Optional[str] = None,
+) -> str:
     """删除文件（移入回收站）。"""
-    ssh = get_ssh()
-    trash = get_trash()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
     # 检查文件是否存在
-    exists = await ssh.file_exists(path)
+    exists = await ctx.ssh.file_exists(path)
     if not exists:
-        await audit.log(
+        await ctx.audit.log(
             operation="delete_file",
             params={"path": path},
             result="error",
@@ -197,9 +231,9 @@ async def handle_delete_file(path: str) -> str:
         return f"❌ 文件不存在: {path}"
 
     # 移入回收站
-    result = await trash.move_to_trash(path, "delete_file")
+    result = await ctx.trash.move_to_trash(path, "delete_file")
 
-    await audit.log(
+    await ctx.audit.log(
         operation="delete_file",
         params={"path": path},
         result="success" if result["success"] else "error",
@@ -212,23 +246,26 @@ async def handle_delete_file(path: str) -> str:
     return f"❌ {result['error']}"
 
 
-async def handle_upload_file(local_path: str, remote_path: str) -> str:
+async def handle_upload_file(
+    local_path: str,
+    remote_path: str,
+    server_name: Optional[str] = None,
+) -> str:
     """上传本地文件到远程主机。"""
-    ssh = get_ssh()
-    trash = get_trash()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
     # 如果远程文件已存在，备份
     rollback_id = None
-    exists = await ssh.file_exists(remote_path)
+    exists = await ctx.ssh.file_exists(remote_path)
     if exists:
-        backup_result = await trash.move_to_trash(remote_path, "upload_backup")
+        backup_result = await ctx.trash.move_to_trash(remote_path, "upload_backup")
         if backup_result["success"]:
             rollback_id = backup_result["entry_id"]
 
-    result = await ssh.upload(local_path, remote_path)
+    result = await ctx.ssh.upload(local_path, remote_path)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="upload_file",
         params={"local_path": local_path, "remote_path": remote_path},
         result="success" if result["success"] else "error",
@@ -244,14 +281,18 @@ async def handle_upload_file(local_path: str, remote_path: str) -> str:
     return f"❌ {result['error']}"
 
 
-async def handle_download_file(remote_path: str, local_path: str) -> str:
+async def handle_download_file(
+    remote_path: str,
+    local_path: str,
+    server_name: Optional[str] = None,
+) -> str:
     """从远程主机下载文件。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    name = resolve_server(server_name)
+    ctx = get_context(name)
 
-    result = await ssh.download(remote_path, local_path)
+    result = await ctx.ssh.download(remote_path, local_path)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="download_file",
         params={"remote_path": remote_path, "local_path": local_path},
         result="success" if result["success"] else "error",
@@ -263,19 +304,22 @@ async def handle_download_file(remote_path: str, local_path: str) -> str:
     return f"❌ {result['error']}"
 
 
-async def handle_list_processes(name: Optional[str] = None) -> str:
+async def handle_list_processes(
+    name: Optional[str] = None,
+    server_name: Optional[str] = None,
+) -> str:
     """列出运行中的进程。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
     if name:
         command = f"ps aux | grep -v grep | grep '{name}' | head -n 200"
     else:
         command = "ps aux --sort=-%cpu | head -n 200"
 
-    result = await ssh.execute(command)
+    result = await ctx.ssh.execute(command)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="list_processes",
         params={"name": name},
         result="success",
@@ -286,13 +330,18 @@ async def handle_list_processes(name: Optional[str] = None) -> str:
     return "📋 没有找到匹配的进程"
 
 
-async def handle_kill_process(pid: int, force: bool = False, confirm_destructive: bool = False) -> str:
+async def handle_kill_process(
+    pid: int,
+    force: bool = False,
+    confirm_destructive: bool = False,
+    server_name: Optional[str] = None,
+) -> str:
     """按 PID 终止进程。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
     if not confirm_destructive:
-        await audit.log(
+        await ctx.audit.log(
             operation="kill_process",
             params={"pid": pid, "force": force},
             result="rejected",
@@ -301,9 +350,9 @@ async def handle_kill_process(pid: int, force: bool = False, confirm_destructive
         return "❌ 此操作不可逆。请设置 confirm_destructive=true 以继续。"
 
     signal = "SIGKILL" if force else "SIGTERM"
-    result = await ssh.execute(f"kill -{signal} {pid}")
+    result = await ctx.ssh.execute(f"kill -{signal} {pid}")
 
-    await audit.log(
+    await ctx.audit.log(
         operation="kill_process",
         params={"pid": pid, "force": force},
         result="success" if result["exit_code"] == 0 else "error",
@@ -316,13 +365,18 @@ async def handle_kill_process(pid: int, force: bool = False, confirm_destructive
     return f"❌ 终止进程失败: {result['stderr']}"
 
 
-async def handle_kill_process_by_name(name: str, force: bool = False, confirm_destructive: bool = False) -> str:
+async def handle_kill_process_by_name(
+    name: str,
+    force: bool = False,
+    confirm_destructive: bool = False,
+    server_name: Optional[str] = None,
+) -> str:
     """按名称终止进程。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
     if not confirm_destructive:
-        await audit.log(
+        await ctx.audit.log(
             operation="kill_process_by_name",
             params={"name": name, "force": force},
             result="rejected",
@@ -331,9 +385,9 @@ async def handle_kill_process_by_name(name: str, force: bool = False, confirm_de
         return "❌ 此操作不可逆。请设置 confirm_destructive=true 以继续。"
 
     signal = "SIGKILL" if force else "SIGTERM"
-    result = await ssh.execute(f"pkill -{signal} '{name}'")
+    result = await ctx.ssh.execute(f"pkill -{signal} '{name}'")
 
-    await audit.log(
+    await ctx.audit.log(
         operation="kill_process_by_name",
         params={"name": name, "force": force},
         result="success" if result["exit_code"] == 0 else "error",
@@ -346,10 +400,12 @@ async def handle_kill_process_by_name(name: str, force: bool = False, confirm_de
     return f"❌ 终止进程失败（可能没有匹配的进程）: {result['stderr']}"
 
 
-async def handle_get_system_info() -> str:
+async def handle_get_system_info(
+    server_name: Optional[str] = None,
+) -> str:
     """获取完整系统信息。"""
-    ssh = get_ssh()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
     commands = {
         "CPU": "lscpu | grep 'Model name\\|CPU(s)' | head -2 && top -bn1 | grep 'Cpu(s)' | head -1",
@@ -360,12 +416,12 @@ async def handle_get_system_info() -> str:
     }
 
     output_parts = ["📊 系统信息:\n"]
-    for name, cmd in commands.items():
-        result = await ssh.execute(cmd)
+    for label, cmd in commands.items():
+        result = await ctx.ssh.execute(cmd)
         if result["stdout"]:
-            output_parts.append(f"### {name}\n```\n{result['stdout'].strip()}\n```")
+            output_parts.append(f"### {label}\n```\n{result['stdout'].strip()}\n```")
 
-    await audit.log(
+    await ctx.audit.log(
         operation="get_system_info",
         params={},
         result="success",
@@ -374,43 +430,63 @@ async def handle_get_system_info() -> str:
     return "\n".join(output_parts)
 
 
-async def handle_get_cpu_info() -> str:
+async def handle_get_cpu_info(
+    server_name: Optional[str] = None,
+) -> str:
     """获取 CPU 信息。"""
-    ssh = get_ssh()
-    result = await ssh.execute("lscpu | grep 'Model name\\|CPU(s)\\|Architecture' && top -bn1 | grep 'Cpu(s)' | head -1")
-    await get_audit().log(operation="get_cpu_info", params={}, result="success")
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.ssh.execute("lscpu | grep 'Model name\\|CPU(s)\\|Architecture' && top -bn1 | grep 'Cpu(s)' | head -1")
+    await ctx.audit.log(operation="get_cpu_info", params={}, result="success")
     return f"🖥 CPU 信息:\n```\n{result['stdout'].strip()}\n```"
 
 
-async def handle_get_memory_info() -> str:
+async def handle_get_memory_info(
+    server_name: Optional[str] = None,
+) -> str:
     """获取内存信息。"""
-    ssh = get_ssh()
-    result = await ssh.execute("free -h")
-    await get_audit().log(operation="get_memory_info", params={}, result="success")
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.ssh.execute("free -h")
+    await ctx.audit.log(operation="get_memory_info", params={}, result="success")
     return f"🧠 内存信息:\n```\n{result['stdout'].strip()}\n```"
 
 
-async def handle_get_disk_info() -> str:
+async def handle_get_disk_info(
+    server_name: Optional[str] = None,
+) -> str:
     """获取磁盘信息。"""
-    ssh = get_ssh()
-    result = await ssh.execute("df -h | head -20")
-    await get_audit().log(operation="get_disk_info", params={}, result="success")
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.ssh.execute("df -h | head -20")
+    await ctx.audit.log(operation="get_disk_info", params={}, result="success")
     return f"💾 磁盘信息:\n```\n{result['stdout'].strip()}\n```"
 
 
-async def handle_get_os_info() -> str:
+async def handle_get_os_info(
+    server_name: Optional[str] = None,
+) -> str:
     """获取操作系统信息。"""
-    ssh = get_ssh()
-    result = await ssh.execute("cat /etc/os-release 2>/dev/null | head -10 || uname -a")
-    await get_audit().log(operation="get_os_info", params={}, result="success")
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.ssh.execute("cat /etc/os-release 2>/dev/null | head -10 || uname -a")
+    await ctx.audit.log(operation="get_os_info", params={}, result="success")
     return f"🐧 操作系统信息:\n```\n{result['stdout'].strip()}\n```"
 
 
-async def handle_get_uptime() -> str:
+async def handle_get_uptime(
+    server_name: Optional[str] = None,
+) -> str:
     """获取系统运行时间。"""
-    ssh = get_ssh()
-    result = await ssh.execute("uptime")
-    await get_audit().log(operation="get_uptime", params={}, result="success")
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.ssh.execute("uptime")
+    await ctx.audit.log(operation="get_uptime", params={}, result="success")
     return f"⏱ 运行时间:\n```\n{result['stdout'].strip()}\n```"
 
 
@@ -419,10 +495,13 @@ async def handle_get_audit_log(
     since: Optional[str] = None,
     until: Optional[str] = None,
     limit: int = 50,
+    server_name: Optional[str] = None,
 ) -> str:
     """查看审计日志。"""
-    audit = get_audit()
-    result = await audit.get_entries(
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.audit.get_entries(
         operation=operation, since=since, until=until, limit=limit
     )
 
@@ -440,10 +519,15 @@ async def handle_get_audit_log(
     return "\n".join(lines)
 
 
-async def handle_list_trash(include_rolled_back: bool = True) -> str:
+async def handle_list_trash(
+    include_rolled_back: bool = True,
+    server_name: Optional[str] = None,
+) -> str:
     """列出回收站内容。"""
-    trash = get_trash()
-    result = await trash.list_trash(include_rolled_back=include_rolled_back)
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.trash.list_trash(include_rolled_back=include_rolled_back)
 
     if not result["entries"]:
         return "📦 回收站为空"
@@ -457,21 +541,25 @@ async def handle_list_trash(include_rolled_back: bool = True) -> str:
         lines.append(f"  {icon} [{entry['id']}] {op}: {path} ({ts})")
 
     # 检查大小警告
-    warning = await trash.check_size_warning()
+    warning = await ctx.trash.check_size_warning()
     if warning:
         lines.append(f"\n{warning}")
 
     return "\n".join(lines)
 
 
-async def handle_restore_file(entry_id: str, target_path: Optional[str] = None) -> str:
+async def handle_restore_file(
+    entry_id: str,
+    target_path: Optional[str] = None,
+    server_name: Optional[str] = None,
+) -> str:
     """从回收站恢复文件。"""
-    trash = get_trash()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
-    result = await trash.restore_file(entry_id, target_path=target_path)
+    result = await ctx.trash.restore_file(entry_id, target_path=target_path)
 
-    await audit.log(
+    await ctx.audit.log(
         operation="restore_file",
         params={"entry_id": entry_id, "target_path": target_path},
         result="success" if result["success"] else "error",
@@ -483,13 +571,16 @@ async def handle_restore_file(entry_id: str, target_path: Optional[str] = None) 
     return f"❌ {result['error']}"
 
 
-async def handle_empty_trash(confirm_destructive: bool = False) -> str:
+async def handle_empty_trash(
+    confirm_destructive: bool = False,
+    server_name: Optional[str] = None,
+) -> str:
     """清空回收站。"""
-    trash = get_trash()
-    audit = get_audit()
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
 
     if not confirm_destructive:
-        await audit.log(
+        await ctx.audit.log(
             operation="empty_trash",
             params={},
             result="rejected",
@@ -497,9 +588,9 @@ async def handle_empty_trash(confirm_destructive: bool = False) -> str:
         )
         return "❌ 此操作不可逆。请设置 confirm_destructive=true 以继续。"
 
-    result = await trash.empty_trash()
+    result = await ctx.trash.empty_trash()
 
-    await audit.log(
+    await ctx.audit.log(
         operation="empty_trash",
         params={},
         result="success",
@@ -508,21 +599,37 @@ async def handle_empty_trash(confirm_destructive: bool = False) -> str:
     return f"✅ 回收站已清空，共删除 {result['deleted_count']} 个条目"
 
 
-async def handle_rollback_operation(entry_id: str) -> str:
+async def handle_rollback_operation(
+    entry_id: str,
+    server_name: Optional[str] = None,
+) -> str:
     """回滚指定操作。"""
-    safety = get_safety()
-    result = await safety.rollback_operation(entry_id)
+    srv_name = resolve_server(server_name)
+    ctx = get_context(srv_name)
+
+    result = await ctx.safety.rollback_operation(entry_id)
 
     if result["success"]:
         return f"✅ 操作已回滚: {entry_id}"
     return f"❌ {result['error']}"
 
 
+async def handle_list_servers() -> str:
+    """列出所有已配置的服务器。"""
+    assert _app_config is not None
+
+    lines = [f"📋 已配置服务器 ({len(_app_config.servers)}):\n"]
+    for s in _app_config.servers:
+        lines.append(f"  🖥 {s.name}: {s.host}:{s.port} ({s.username})")
+
+    return "\n".join(lines)
+
+
 # ============================================================
-# 工具定义
+# 工具定义（基础模板，不含 server_name）
 # ============================================================
 
-TOOLS = [
+_BASE_TOOLS = [
     Tool(
         name="run_command",
         description="在远程 Linux 主机上执行 Shell 命令。危险命令需要提供回滚命令。",
@@ -731,6 +838,12 @@ TOOLS = [
     ),
 ]
 
+_LIST_SERVERS_TOOL = Tool(
+    name="list_servers",
+    description="列出所有已配置的服务器及其连接信息。",
+    inputSchema={"type": "object", "properties": {}},
+)
+
 # 工具名 -> 处理函数映射
 TOOL_HANDLERS = {
     "run_command": handle_run_command,
@@ -754,7 +867,33 @@ TOOL_HANDLERS = {
     "restore_file": handle_restore_file,
     "empty_trash": handle_empty_trash,
     "rollback_operation": handle_rollback_operation,
+    "list_servers": handle_list_servers,
 }
+
+
+def _build_tools() -> list[Tool]:
+    """根据服务器数量动态构建工具列表。"""
+    assert _app_config is not None
+
+    if _app_config.is_single_server:
+        return list(_BASE_TOOLS)
+
+    # 多服务器模式：每个工具加 server_name
+    tools = []
+    for base in _BASE_TOOLS:
+        schema = copy.deepcopy(base.inputSchema)
+        schema["properties"]["server_name"] = {
+            "type": "string",
+            "description": "目标服务器名称（必填）。使用 list_servers 查看可用服务器。",
+        }
+        schema["required"] = ["server_name"] + schema.get("required", [])
+        description = base.description + " ⚠️ 必须指定 server_name 参数。"
+        tools.append(Tool(name=base.name, description=description, inputSchema=schema))
+
+    # 加 list_servers
+    tools.append(_LIST_SERVERS_TOOL)
+
+    return tools
 
 
 # ============================================================
@@ -762,25 +901,36 @@ TOOL_HANDLERS = {
 # ============================================================
 
 
-async def init_components(config: Config) -> None:
+async def init_components(config: AppConfig) -> None:
     """初始化所有组件。"""
-    global _config, _ssh, _audit, _trash, _safety
+    global _app_config, _contexts
 
-    _config = config
-    _ssh = SSHClient(config)
-    _audit = AuditLogger(config, _ssh)
-    _trash = TrashManager(config, _ssh)
-    _safety = SafetyGate(config, _ssh, _audit, _trash)
+    _app_config = config
+    _contexts = {}
 
-    logger.info("所有组件已初始化")
+    for server_config in config.servers:
+        ssh = SSHClient(server_config)
+        audit = AuditLogger(server_config, ssh)
+        trash = TrashManager(server_config, ssh)
+        safety = SafetyGate(server_config, ssh, audit, trash)
+
+        _contexts[server_config.name] = ServerContext(
+            config=server_config,
+            ssh=ssh,
+            audit=audit,
+            trash=trash,
+            safety=safety,
+        )
+        logger.info("服务器 '%s' 已初始化 (%s@%s:%d)",
+                     server_config.name, server_config.username,
+                     server_config.host, server_config.port)
 
 
 async def shutdown_components() -> None:
     """关闭所有组件。"""
-    global _ssh
-    if _ssh:
-        await _ssh.disconnect()
-        logger.info("SSH 连接已关闭")
+    for name, ctx in _contexts.items():
+        await ctx.ssh.disconnect()
+        logger.info("服务器 '%s' SSH 连接已关闭", name)
 
 
 def create_mcp_server() -> Server:
@@ -789,7 +939,7 @@ def create_mcp_server() -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        return TOOLS
+        return _build_tools()
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
@@ -800,6 +950,9 @@ def create_mcp_server() -> Server:
         try:
             result = await handler(**arguments)
             return [TextContent(type="text", text=str(result))]
+        except ValueError as e:
+            # resolve_server 抛出的验证错误
+            return [TextContent(type="text", text=f"❌ {str(e)}")]
         except Exception as e:
             logger.exception("工具执行异常: %s", name)
             return [TextContent(type="text", text=f"❌ 工具执行异常: {str(e)}")]
@@ -807,9 +960,9 @@ def create_mcp_server() -> Server:
     return server
 
 
-async def run_server(config_path: Optional[str] = None) -> None:
+async def run_server(config_path: str) -> None:
     """运行 MCP 服务器。"""
-    config = create_config(config_path)
+    config = load_config(config_path)
     await init_components(config)
 
     server = create_mcp_server()
@@ -826,8 +979,8 @@ def main() -> None:
         "--config",
         "-c",
         type=str,
-        default=None,
-        help="JSON 配置文件路径",
+        required=True,
+        help="JSON 配置文件路径（必填）",
     )
     parser.add_argument(
         "--log-level",

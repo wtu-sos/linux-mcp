@@ -7,7 +7,7 @@ import string
 from datetime import datetime
 from typing import Any, Optional
 
-from .config import Config
+from .config import ServerConfig
 from .ssh_client import SSHClient
 
 logger = logging.getLogger(__name__)
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class TrashManager:
     """回收站管理器，管理 ~/.linux_mcp_trash/ 目录。"""
 
-    def __init__(self, config: Config, ssh_client: SSHClient):
+    def __init__(self, config: ServerConfig, ssh_client: SSHClient):
         self._config = config
         self._ssh = ssh_client
         self._trash_dir = config.trash_dir_expanded
