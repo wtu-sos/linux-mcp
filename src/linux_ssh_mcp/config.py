@@ -19,6 +19,11 @@ class ServerConfig(BaseModel):
     timeout: int = Field(default=30, description="连接超时（秒）")
     command_timeout: int = Field(default=60, description="命令执行超时（秒）")
 
+    # 非配置字段：由 load_config() 自动设置
+    project_dir: Optional[str] = Field(
+        default=None, exclude=True, description="配置文件所在目录（自动设置）"
+    )
+
     # Output limits
     max_output_size: int = Field(
         default=1024 * 1024, description="命令输出最大大小（字节），默认 1MB"
@@ -83,11 +88,39 @@ class ServerConfig(BaseModel):
     def audit_log_path_expanded(self) -> str:
         return self.expand_remote_path(self.audit_log_path)
 
-    @property
-    def key_file_expanded(self) -> Optional[str]:
-        if self.key_file:
+    def _is_absolute_path(self, path: str) -> bool:
+        """判断是否为绝对路径（Unix / 开头或 Windows 盘符开头）。"""
+        return path.startswith("/") or (len(path) >= 2 and path[1] == ":")
+
+    def key_file_resolved(self) -> Optional[str]:
+        """解析密钥文件路径。
+
+        优先级：
+        1. 绝对路径或 ~ 开头 → expand_local_path 直接展开
+        2. 相对路径 → 先查工程目录，再查 ~/.ssh/
+        """
+        if not self.key_file:
+            return None
+
+        # 绝对路径或 ~ 开头：直接展开
+        if self._is_absolute_path(self.key_file) or self.key_file.startswith("~"):
             return self.expand_local_path(self.key_file)
-        return None
+
+        # 相对路径：工程目录优先
+        if self.project_dir:
+            candidate = os.path.join(self.project_dir, self.key_file)
+            if os.path.isfile(candidate):
+                return candidate
+
+        # 回退到 ~/.ssh/
+        fallback = os.path.expanduser(f"~/.ssh/{self.key_file}")
+        if os.path.isfile(fallback):
+            return fallback
+
+        # 都不存在，返回工程目录路径（让 asyncssh 报清晰的错误）
+        if self.project_dir:
+            return os.path.join(self.project_dir, self.key_file)
+        return fallback
 
 
 class AppConfig(BaseModel):
@@ -160,10 +193,14 @@ def load_config(config_path: str) -> AppConfig:
     # 提取 defaults
     defaults = raw.pop("defaults", {})
 
+    # 工程目录 = 配置文件所在目录
+    project_dir = os.path.dirname(os.path.abspath(config_path))
+
     # 合并并构建 ServerConfig
     servers = []
     for s in raw["servers"]:
         merged = _merge_with_defaults(s, defaults)
+        merged["project_dir"] = project_dir
         servers.append(ServerConfig(**merged))
 
     return AppConfig(servers=servers)

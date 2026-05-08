@@ -32,8 +32,8 @@ class SSHClient:
             "known_hosts": None,  # 跳过 known_hosts 检查
         }
 
-        if self._config.key_file_expanded:
-            connect_kwargs["client_keys"] = [self._config.key_file_expanded]
+        if self._config.key_file_resolved():
+            connect_kwargs["client_keys"] = [self._config.key_file_resolved()]
         elif self._config.password:
             connect_kwargs["password"] = self._config.password
 

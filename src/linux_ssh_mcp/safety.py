@@ -21,9 +21,14 @@ SAFE_COMMANDS = [
     "lsof", "pgrep", "pidof",
 ]
 
+# 禁止命令（应使用专用工具，如 delete_file）
+BLOCKED_COMMANDS = [
+    "rm ", "rmdir ", "unlink ",
+]
+
 # 危险命令模式（需要回滚命令）
 DANGEROUS_COMMANDS = [
-    "rm ", "mv ", "dd ", "mkfs", "fdisk", "parted",
+    "mv ", "dd ", "mkfs", "fdisk", "parted",
     "apt ", "apt-get ", "yum ", "dnf ", "zypper ",
     "pip install", "pip uninstall", "npm install", "npm uninstall",
     "chmod ", "chown ", "useradd ", "usermod ", "userdel ",
@@ -59,14 +64,20 @@ class CommandClassifier:
 
     @staticmethod
     def classify(command: str) -> str:
-        """分类命令：safe / dangerous / irreversible。
+        """分类命令：safe / dangerous / blocked / irreversible。
 
         Returns:
             "safe": 安全命令，可直接执行
             "dangerous": 危险命令，需要回滚命令
+            "blocked": 禁止命令，应使用专用工具
             "irreversible": 不可逆命令，需要确认
         """
         cmd_stripped = command.strip()
+
+        # 检查是否是禁止命令（应使用专用工具）
+        for blocked_pattern in BLOCKED_COMMANDS:
+            if blocked_pattern in cmd_stripped:
+                return "blocked"
 
         # 检查是否是安全命令
         for safe_pattern in SAFE_COMMANDS:
@@ -151,18 +162,47 @@ class SafetyGate:
         if classification == "safe":
             return {"allowed": True}
 
+        if classification == "blocked":
+            return {
+                "allowed": False,
+                "reason": (
+                    f"禁止直接执行删除命令。请使用 delete_file 工具，"
+                    f"文件将被移入回收站，可随时恢复。"
+                ),
+            }
+
         if classification == "dangerous":
-            if not rollback_command:
+            if not rollback_command or not self._is_valid_rollback(rollback_command):
                 return {
                     "allowed": False,
                     "reason": (
-                        f"危险命令需要提供回滚命令。命令分类: {classification}。"
-                        f"请提供 rollback_command 参数。"
+                        f"危险命令需要提供有效的回滚命令。命令分类: {classification}。"
+                        f"请提供 rollback_command 参数（不能为空或无效命令）。"
                     ),
                 }
             return {"allowed": True, "classification": classification}
 
         return {"allowed": True}
+
+    @staticmethod
+    def _is_valid_rollback(rollback_command: str) -> bool:
+        """验证回滚命令是否有效。
+
+        拒绝 trivial 回滚命令（echo、true、: 等无操作命令）。
+        """
+        cmd = rollback_command.strip()
+        if not cmd:
+            return False
+
+        # 拒绝纯无操作命令
+        trivial_patterns = [
+            "echo", "true", ":", "false",
+        ]
+        for pattern in trivial_patterns:
+            if cmd == pattern or cmd.startswith(pattern + " "):
+                return False
+
+        return True
 
     async def pre_check_destructive(self) -> dict[str, Any]:
         """不可逆操作前检查（需要 confirm_destructive）。"""
